@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ rec.label }} — Backtest Report</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+               max-width: 1280px; margin: 0 auto; padding: 24px; color: #222;
+               background: #fafafa; }
+        h1 { margin: 0 0 4px 0; }
+        h2 { margin-top: 32px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+        .meta { color: #666; margin-bottom: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px; margin-bottom: 24px; }
+        .card { background: white; border: 1px solid #ddd; border-radius: 6px;
+                padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .card .label { font-size: 11px; color: #888; text-transform: uppercase;
+                       letter-spacing: 0.5px; }
+        .card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+        .positive { color: #2a8c4a; }
+        .negative { color: #c44; }
+        table { border-collapse: collapse; width: 100%; background: white;
+                margin-bottom: 16px; font-size: 13px; }
+        th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: right; }
+        th { background: #f5f5f5; font-weight: 600; }
+        th:first-child, td:first-child { text-align: left; }
+        td.num { font-variant-numeric: tabular-nums; }
+        .chart { margin: 16px 0; }
+        .chart img { max-width: 100%; height: auto; border: 1px solid #ddd; }
+        .trade-list { font-size: 12px; max-height: 600px; overflow-y: auto; }
+        .pill { display: inline-block; padding: 2px 8px; border-radius: 10px;
+                background: #eee; font-size: 11px; margin-right: 6px; }
+    </style>
+</head>
+<body>
+    <h1>{{ rec.strategy_key }} — {{ rec.mode }}</h1>
+    <div class="meta">
+        <span class="pill">Direction: {{ rec.direction }}</span>
+        <span class="pill">Leverage: {{ rec.leverage }}x</span>
+        <span class="pill">Purpose: {{ rec.purpose }}</span>
+        <span class="pill">{{ rec.label }}</span>
+        <br>
+        Generated: {{ generated_at }}
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="label">Final Equity (Full)</div>
+            <div class="value {% if rec.metrics_full.total_return_pct > 0 %}positive{% else %}negative{% endif %}">
+                ${{ "{:,.2f}".format(rec.metrics_full.period_final_usd) }}
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Total Return (Full)</div>
+            <div class="value {% if rec.metrics_full.total_return_pct > 0 %}positive{% else %}negative{% endif %}">
+                {{ "{:+.2f}%".format(rec.metrics_full.total_return_pct) }}
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">CAGR (Full)</div>
+            <div class="value">{{ "{:.2f}%".format(rec.metrics_full.cagr_pct) }}</div>
+        </div>
+        <div class="card">
+            <div class="label">Max Drawdown (Full)</div>
+            <div class="value negative">{{ "{:.2f}%".format(rec.metrics_full.max_dd_pct) }}</div>
+        </div>
+        <div class="card">
+            <div class="label">Sharpe Ratio (Full)</div>
+            <div class="value">{{ "{:.2f}".format(rec.metrics_full.sharpe) }}</div>
+        </div>
+        <div class="card">
+            <div class="label">Total Trades</div>
+            <div class="value">{{ rec.metrics_full.total_trades }}</div>
+        </div>
+    </div>
+
+    <h2>Metrics — Period Comparison</h2>
+    <table>
+        <tr>
+            <th>Metric</th>
+            <th>Full (2020-2024)</th>
+            {% if rec.metrics_is %}<th>In-Sample (2020-2023)</th>{% endif %}
+            {% if rec.metrics_oos %}<th>Out-of-Sample (2024)</th>{% endif %}
+        </tr>
+        {% for metric_key, label, fmt in metric_rows %}
+        <tr>
+            <td>{{ label }}</td>
+            <td class="num">{{ fmt(rec.metrics_full.get(metric_key, '-')) }}</td>
+            {% if rec.metrics_is %}<td class="num">{{ fmt(rec.metrics_is.get(metric_key, '-')) }}</td>{% endif %}
+            {% if rec.metrics_oos %}<td class="num">{{ fmt(rec.metrics_oos.get(metric_key, '-')) }}</td>{% endif %}
+        </tr>
+        {% endfor %}
+    </table>
+
+    <h2>Equity Curve</h2>
+    <div class="chart"><img src="data:image/png;base64,{{ chart_equity }}" alt="Equity curve"></div>
+
+    <h2>Drawdown</h2>
+    <div class="chart"><img src="data:image/png;base64,{{ chart_drawdown }}" alt="Drawdown"></div>
+
+    {% if chart_monthly %}
+    <h2>Monthly Returns Heatmap</h2>
+    <div class="chart"><img src="data:image/png;base64,{{ chart_monthly }}" alt="Monthly heatmap"></div>
+    {% endif %}
+
+    {% if chart_histogram %}
+    <h2>Daily Returns Distribution</h2>
+    <div class="chart"><img src="data:image/png;base64,{{ chart_histogram }}" alt="Returns histogram"></div>
+    {% endif %}
+
+    <h2>Trade List ({{ rec.result.trades|length }} trades)</h2>
+    {% if rec.result.trades %}
+    <div class="trade-list">
+    <table>
+        <tr>
+            <th>#</th><th>Side</th><th>Entry</th><th>Exit</th>
+            <th>Entry Price</th><th>Exit Price</th><th>Notional</th>
+            <th>PnL USD</th><th>PnL %</th><th>Hold (days)</th><th>Reason</th>
+        </tr>
+        {% for t in rec.result.trades %}
+        <tr>
+            <td>{{ t.trade_id }}</td>
+            <td>{{ t.side }}</td>
+            <td>{{ t.entry_time.strftime("%Y-%m-%d %H:%M") }}</td>
+            <td>{{ t.exit_time.strftime("%Y-%m-%d %H:%M") }}</td>
+            <td class="num">${{ "{:,.2f}".format(t.entry_price) }}</td>
+            <td class="num">${{ "{:,.2f}".format(t.exit_price) }}</td>
+            <td class="num">${{ "{:,.2f}".format(t.notional_at_entry) }}</td>
+            <td class="num {% if t.pnl_usd > 0 %}positive{% else %}negative{% endif %}">
+                ${{ "{:+,.2f}".format(t.pnl_usd) }}
+            </td>
+            <td class="num {% if t.pnl_pct > 0 %}positive{% else %}negative{% endif %}">
+                {{ "{:+.2%}".format(t.pnl_pct) }}
+            </td>
+            <td class="num">{{ "{:.1f}".format(t.hold_days) }}</td>
+            <td>{{ t.exit_reason.value }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    </div>
+    {% else %}
+    <p>No trades executed.</p>
+    {% endif %}
+
+</body>
+</html>

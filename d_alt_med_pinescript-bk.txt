@@ -1,0 +1,219 @@
+// ============================================================
+//  D-Alt-Med — Vol-Targeted Donchian Breakout (40/15)
+//  TradingView Pine Script v6 — Mirror 1:1 of m-trade backtest strategy
+//
+//  RULES (identical to backend bot):
+//    ENTRY:  Close > max(high of past 40 bars, EXCLUDING current)
+//    EXIT:   Close < min(low  of past 15 bars, EXCLUDING current)
+//    SIZE:   Notional = (0.30 / sigma_annual) × equity
+//            - sigma_annual = stdev(log_returns, 30 bars) × √365
+//            - Skip trade if target_fraction < 5%
+//            - Cap at 100% of equity (spot 1x)
+//    DIRECTION: Long only. No stops. No circuit breakers.
+//
+//  WARNING (visual only — does NOT halt execution):
+//    - Yellow background when drawdown from peak ≥ 20%
+//    - Red background when drawdown from peak ≥ 30%
+//    - Drawdown computed on strategy.equity (mark-to-market)
+//
+//  USAGE:
+//    1. Paste into TradingView Pine Editor (any symbol, any timeframe)
+//    2. Set chart to DAILY (1D) — strategy is daily-only
+//    3. Initial capital, commission and slippage are pre-configured
+//    4. Add chart alerts on "D-Alt-Med LONG Entry" / "D-Alt-Med EXIT"
+//
+//  IMPORTANT:
+//    - The strategy executes at NEXT BAR OPEN after a signal
+//      (matches backtest convention, anti look-ahead)
+//    - Donchian channels use [1] shift to exclude current bar
+//    - Commission 0.15% combines 0.1% spot fee + 0.05% slippage per side
+//    - Built for any symbol (run on BTCUSDT, ETHUSDT, etc.)
+// ============================================================
+
+//@version=6
+strategy(
+     title                   = "D-Alt-Med — Vol-Targeted Donchian Breakout (40/15)",
+     shorttitle              = "D-AltMed",
+     overlay                 = true,
+     initial_capital         = 1000,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.15,
+     pyramiding              = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 50,
+     close_entries_rule      = "ANY")
+
+// ============================================================
+// INPUTS
+// ============================================================
+g_strat = "Strategy Parameters"
+n_entry  = input.int(40,    "Donchian Entry Period (days)",  group=g_strat, minval=2,    maxval=200,
+                            tooltip="D-Alt-Med default = 40. D-Primary = 55. D-Alt-Short = 20.")
+n_exit   = input.int(15,    "Donchian Exit Period (days)",   group=g_strat, minval=2,    maxval=200,
+                            tooltip="D-Alt-Med default = 15. D-Primary = 20. D-Alt-Short = 10.")
+vol_tgt  = input.float(0.30,"Vol Target (annual)",           group=g_strat, step=0.05,   minval=0.05, maxval=1.0,
+                            tooltip="30% annualized = AQR standard. Lower = more conservative.")
+vol_lkbk = input.int(30,    "Vol Lookback (days)",           group=g_strat, minval=5,    maxval=120)
+vol_min  = input.float(0.05,"Min Notional Fraction (skip)",  group=g_strat, step=0.01,   minval=0.0,  maxval=0.5,
+                            tooltip="Skip trade if vol-target requires position below this fraction.")
+vol_max  = input.float(1.00,"Max Notional Fraction (cap)",   group=g_strat, step=0.10,   minval=0.1,  maxval=2.0,
+                            tooltip="100% = spot 1x. Set 2.00 for futures 2x.")
+annual_d = input.int(365,   "Annualization Days",            group=g_strat, minval=252,  maxval=365,
+                            tooltip="365 for crypto (24/7). 252 for traditional markets.")
+
+g_warn = "Warning Thresholds (visual only, no halt)"
+dd_yellow = input.float(20.0, "Yellow DD Warning (%)",       group=g_warn, step=1.0,    minval=5.0,  maxval=50.0)
+dd_red    = input.float(30.0, "Red DD Warning (%)",          group=g_warn, step=1.0,    minval=10.0, maxval=70.0)
+
+g_viz = "Visuals"
+show_channels = input.bool(true, "Show Donchian Channels",   group=g_viz)
+show_arrows   = input.bool(true, "Show Entry/Exit Arrows",   group=g_viz)
+show_info     = input.bool(true, "Show Info Table",          group=g_viz)
+show_dd_bg    = input.bool(true, "Show DD Warning Background", group=g_viz)
+
+// ============================================================
+// INDICATORS
+// (anti look-ahead: [1] shift excludes current bar from window)
+// ============================================================
+donch_high_in = ta.highest(high, n_entry)[1]
+donch_low_out = ta.lowest(low,  n_exit)[1]
+
+// Realized vol from log returns
+log_ret      = math.log(close / nz(close[1], close))
+sigma_daily  = ta.stdev(log_ret, vol_lkbk)
+sigma_annual = sigma_daily * math.sqrt(annual_d)
+
+// Vol-target sizing
+raw_fraction    = sigma_annual > 0 ? vol_tgt / sigma_annual : 0.0
+capped_fraction = raw_fraction < vol_min ? 0.0 : math.min(raw_fraction, vol_max)
+
+// Position size in units (e.g., BTC for BTCUSDT)
+qty_units = capped_fraction > 0 ? capped_fraction * strategy.equity / close : 0.0
+
+// Warmup completion check
+warm = not na(donch_high_in) and not na(donch_low_out) and not na(sigma_annual)
+
+// ============================================================
+// SIGNALS (evaluated at bar close)
+// ============================================================
+long_signal = warm and capped_fraction > 0 and close > donch_high_in
+exit_signal = warm and close < donch_low_out
+
+// ============================================================
+// EXECUTION
+// (Pine v6 default: orders submitted at bar close fill at NEXT bar open)
+// ============================================================
+if long_signal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=qty_units, comment="DonchBreakout")
+
+if exit_signal and strategy.position_size > 0
+    strategy.close("Long", comment="DonchExit")
+
+// ============================================================
+// DRAWDOWN TRACKING
+// ============================================================
+var float peak_equity = strategy.initial_capital
+peak_equity := math.max(peak_equity, strategy.equity)
+dd_from_peak = peak_equity > 0 ? (peak_equity - strategy.equity) / peak_equity * 100.0 : 0.0
+
+in_yellow_zone = dd_from_peak >= dd_yellow and dd_from_peak < dd_red
+in_red_zone    = dd_from_peak >= dd_red
+
+// ============================================================
+// VISUALS — Donchian channels
+// ============================================================
+p_high = plot(show_channels ? donch_high_in : na,
+              title="Donchian High (Entry)",
+              color=color.new(color.lime, 20), linewidth=2, style=plot.style_line)
+p_low  = plot(show_channels ? donch_low_out : na,
+              title="Donchian Low (Exit)",
+              color=color.new(color.red, 20),  linewidth=2, style=plot.style_line)
+fill(p_high, p_low, color=show_channels ? color.new(color.gray, 92) : na, title="Channel Fill")
+
+// VISUALS — Entry/Exit arrows
+plotshape(show_arrows and long_signal and strategy.position_size == 0,
+          title="Long Entry Signal", location=location.belowbar,
+          color=color.new(color.lime, 0), style=shape.triangleup, size=size.small, text="LONG")
+plotshape(show_arrows and exit_signal and strategy.position_size > 0,
+          title="Exit Signal", location=location.abovebar,
+          color=color.new(color.red, 0), style=shape.triangledown, size=size.small, text="EXIT")
+
+// VISUALS — Drawdown warning background
+bgcolor(show_dd_bg and in_yellow_zone ? color.new(color.yellow, 85) : na, title="Yellow DD Zone")
+bgcolor(show_dd_bg and in_red_zone    ? color.new(color.red,    85) : na, title="Red DD Zone")
+
+// VISUALS — Info table (top right corner)
+var table info_tbl = table.new(position.top_right, 2, 9,
+                                frame_color=color.new(color.black, 0),
+                                frame_width=1,
+                                border_color=color.new(color.gray, 50),
+                                border_width=1)
+
+if show_info and barstate.islast
+    pos_status = strategy.position_size > 0 ?
+                 "LONG " + str.tostring(strategy.position_size, "#.######") : "FLAT"
+    pos_color  = strategy.position_size > 0 ? color.new(color.lime, 30) : color.new(color.gray, 30)
+    dd_color   = in_red_zone ? color.new(color.red, 0) :
+                 in_yellow_zone ? color.new(color.yellow, 0) : color.new(color.white, 0)
+
+    header_bg = color.new(color.gray, 30)
+    body_bg   = color.new(color.black, 70)
+
+    table.cell(info_tbl, 0, 0, "D-Alt-Med",                     text_color=color.white, bgcolor=header_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 0, str.tostring(n_entry) + "/" + str.tostring(n_exit), text_color=color.white, bgcolor=header_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 1, "Symbol",                        text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 1, syminfo.ticker,                  text_color=color.white, bgcolor=body_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 2, "Vol Annual",                    text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 2, str.tostring(sigma_annual * 100, "#.#") + "%", text_color=color.white, bgcolor=body_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 3, "Target Size",                   text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 3, str.tostring(capped_fraction * 100, "#.#") + "%", text_color=color.white, bgcolor=body_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 4, "Equity",                        text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 4, "$" + str.tostring(strategy.equity, "#.##"), text_color=color.white, bgcolor=body_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 5, "Peak Equity",                   text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 5, "$" + str.tostring(peak_equity, "#.##"), text_color=color.white, bgcolor=body_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 6, "DD from Peak",                  text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 6, "-" + str.tostring(dd_from_peak, "#.##") + "%", text_color=dd_color, bgcolor=body_bg, text_size=size.small)
+
+    table.cell(info_tbl, 0, 7, "Position",                      text_color=color.white, bgcolor=pos_color, text_size=size.small)
+    table.cell(info_tbl, 1, 7, pos_status,                      text_color=color.white, bgcolor=pos_color, text_size=size.small)
+
+    table.cell(info_tbl, 0, 8, "Entry / Exit",                  text_color=color.white, bgcolor=body_bg, text_size=size.small)
+    table.cell(info_tbl, 1, 8, str.tostring(donch_high_in, "#.##") + " / " + str.tostring(donch_low_out, "#.##"),
+               text_color=color.white, bgcolor=body_bg, text_size=size.small)
+
+// ============================================================
+// ALERTS — Entry / Exit signals only
+// (Use these via TradingView "Create Alert" → Condition dropdown)
+// ============================================================
+alertcondition(long_signal and strategy.position_size == 0,
+               title="D-Alt-Med LONG Entry",
+               message="D-Alt-Med LONG ENTRY on {{ticker}} @ close={{close}}. Donchian-40 high breakout.")
+
+alertcondition(exit_signal and strategy.position_size > 0,
+               title="D-Alt-Med EXIT",
+               message="D-Alt-Med EXIT on {{ticker}} @ close={{close}}. Donchian-15 low broken.")
+
+// Inline alerts with richer context (use TV "Any alert() function call" mode)
+if long_signal and strategy.position_size == 0
+    alert("📈 D-Alt-Med LONG ENTRY on " + syminfo.tickerid +
+          " @ " + str.tostring(close, "#.##") +
+          " | Donchian-" + str.tostring(n_entry) + " High: " + str.tostring(donch_high_in, "#.##") +
+          " | Vol annual: " + str.tostring(sigma_annual * 100, "#.#") + "%" +
+          " | Target size: " + str.tostring(capped_fraction * 100, "#.#") + "%" +
+          " | Order fills at next bar OPEN",
+          alert.freq_once_per_bar_close)
+
+if exit_signal and strategy.position_size > 0
+    alert("📉 D-Alt-Med EXIT on " + syminfo.tickerid +
+          " @ " + str.tostring(close, "#.##") +
+          " | Donchian-" + str.tostring(n_exit) + " Low: " + str.tostring(donch_low_out, "#.##") +
+          " | Order fills at next bar OPEN",
+          alert.freq_once_per_bar_close)
