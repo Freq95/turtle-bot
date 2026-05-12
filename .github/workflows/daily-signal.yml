@@ -25,8 +25,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run signal check (with Telegram alert if signal fires)
+      - name: Run signal check (with Telegram alert)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python check_signal.py --telegram
+          # SIGNAL_EXCHANGE: kraken    # Default. Override to 'coinbase', 'bitstamp', 'okx' if needed.
+          # SIGNAL_SYMBOL: BTC/USDT    # Default.
+        # --always-send: send daily status message even if no signal fires.
+        # Remove --always-send after 1 week of verification to get only signal-day alerts.
+        run: python check_signal.py --telegram --always-send

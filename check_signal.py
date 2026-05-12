@@ -1,31 +1,20 @@
 """
-Daily signal checker — D-Alt-Med (40/15) Donchian breakout on BTC/USDT spot.
+Daily signal checker — D-Alt-Med (40/15) Donchian breakout on BTC/USDT.
 
-Replaces TradingView paid alerts. Run manually or via Windows Task Scheduler.
+Self-contained: fetches data directly via ccxt without depending on local SQLite cache.
+Uses Kraken by default (works in GitHub Actions cloud; Binance blocks US IPs with 451).
+Override with env var SIGNAL_EXCHANGE if needed.
 
 Usage:
-    python check_signal.py                  # Console output only
-    python check_signal.py --telegram       # Also send Telegram alert (needs env vars)
+    python check_signal.py                          # Console output only
+    python check_signal.py --telegram               # Console + Telegram on signal
+    python check_signal.py --telegram --always-send # Console + Telegram EVERY day (verification mode)
 
-Telegram setup (optional, free):
-    1. Open Telegram → search @BotFather → /newbot → get bot token
-    2. Send /start to your new bot, then visit:
-       https://api.telegram.org/bot<TOKEN>/getUpdates
-       Find "chat":{"id":<NUMBER>} → that's your chat_id
-    3. Set environment variables:
-       Windows PowerShell:
-         $env:TELEGRAM_BOT_TOKEN="123456:abc..."
-         $env:TELEGRAM_CHAT_ID="123456789"
-       Then run:
-         python check_signal.py --telegram
-
-Windows daily auto-run (free):
-    1. Open Task Scheduler → Create Basic Task
-    2. Trigger: Daily, 00:30 UTC (after daily bar close)
-    3. Action: Start a program
-       Program: python.exe (or full path C:\\Users\\Paul\\AppData\\Local\\Programs\\Python\\Python312\\python.exe)
-       Arguments: D:\\m-trade\\check_signal.py --telegram
-       Start in: D:\\m-trade
+Environment variables:
+    TELEGRAM_BOT_TOKEN   — from @BotFather
+    TELEGRAM_CHAT_ID     — your chat id from getUpdates
+    SIGNAL_EXCHANGE      — ccxt exchange id (default: kraken). Try: kraken, coinbase, bitstamp, okx
+    SIGNAL_SYMBOL        — symbol to track (default: BTC/USDT)
 """
 
 from __future__ import annotations
@@ -37,11 +26,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+import ccxt
+import numpy as np
 import pandas as pd
-
-import config
-from backtest import indicators as ind
-from data_loader import load_or_fetch
 
 
 # ============================================================
@@ -53,10 +40,11 @@ VOL_TARGET = 0.30
 VOL_LOOKBACK = 30
 VOL_MIN = 0.05
 VOL_MAX = 1.00  # spot 1x
+ANNUALIZATION = 365
 
 
 # ============================================================
-# Telegram helper (free, optional)
+# Telegram helper
 # ============================================================
 
 def send_telegram(message: str) -> bool:
@@ -66,20 +54,17 @@ def send_telegram(message: str) -> bool:
         print("[telegram] Skipped — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env var not set.")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    params = {
+    payload = {
         "chat_id": chat_id,
         "text": message,
         "parse_mode": "Markdown",
     }
-    data = urllib.parse.urlencode(params).encode("utf-8")
+    data = urllib.parse.urlencode(payload).encode("utf-8")
     try:
         req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             ok = resp.status == 200
-            if ok:
-                print("[telegram] Message sent.")
-            else:
-                print(f"[telegram] HTTP {resp.status}")
+            print(f"[telegram] {'sent' if ok else f'HTTP {resp.status}'}")
             return ok
     except Exception as e:
         print(f"[telegram] Error: {e}")
@@ -87,99 +72,125 @@ def send_telegram(message: str) -> bool:
 
 
 # ============================================================
+# Data fetch (cloud-friendly: uses Kraken by default)
+# ============================================================
+
+def fetch_recent_daily(symbol: str = "BTC/USDT", days: int = 120) -> pd.DataFrame:
+    """
+    Fetch recent daily OHLCV. Uses Kraken by default (works globally including
+    GitHub Actions runners). Override via SIGNAL_EXCHANGE env var.
+    """
+    exchange_id = os.getenv("SIGNAL_EXCHANGE", "kraken").lower()
+    print(f"Source: {exchange_id} / {symbol} / last ~{days} days")
+    try:
+        exchange = getattr(ccxt, exchange_id)({"enableRateLimit": True})
+    except AttributeError:
+        raise RuntimeError(f"Unknown exchange: {exchange_id}")
+
+    since_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    bars = exchange.fetch_ohlcv(symbol, "1d", since=since_ms, limit=days + 50)
+    if not bars:
+        raise RuntimeError(f"No bars returned from {exchange_id} for {symbol}")
+
+    df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.set_index("timestamp")
+    return df
+
+
+# ============================================================
+# Indicator math (inline, no external deps)
+# ============================================================
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["donch_high_entry"] = df["high"].rolling(N_ENTRY).max().shift(1)
+    df["donch_low_exit"] = df["low"].rolling(N_EXIT).min().shift(1)
+    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
+    df["sigma_daily"] = df["log_ret"].rolling(VOL_LOOKBACK).std(ddof=1)
+    df["sigma_annual"] = df["sigma_daily"] * np.sqrt(ANNUALIZATION)
+    return df
+
+
+# ============================================================
 # Signal check
 # ============================================================
 
-def check_signal(send_alert: bool = False) -> dict:
-    # Fetch fresh data (force refresh to get today's daily bar if available)
-    today = datetime.now(timezone.utc)
-    data_end = today + timedelta(days=1)  # try to include today's bar
+def check_signal(send_alert: bool = False, always_send: bool = False) -> dict:
+    now_utc = datetime.now(timezone.utc)
 
     print(f"\n{'=' * 60}")
-    print(f"D-Alt-Med (40/15) Signal Check — {today.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"D-Alt-Med (40/15) Signal Check — {now_utc.strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'=' * 60}\n")
 
-    print("Fetching latest BTC daily data from Binance...")
-    df = load_or_fetch(
-        symbol=config.SYMBOL,
-        timeframe="1d",
-        start_dt=datetime(2024, 1, 1),  # need ~6 months for indicators
-        end_dt=data_end,
-        force_refresh=True,
-    )
+    symbol = os.getenv("SIGNAL_SYMBOL", "BTC/USDT")
+    df = fetch_recent_daily(symbol=symbol, days=120)
+    df = compute_indicators(df)
 
-    if len(df) < N_ENTRY + 10:
-        print(f"ERROR: insufficient data ({len(df)} bars).")
+    if len(df) < N_ENTRY + VOL_LOOKBACK:
+        msg = f"ERROR: insufficient data ({len(df)} bars, need at least {N_ENTRY + VOL_LOOKBACK})."
+        print(msg)
+        if send_alert:
+            send_telegram(f"⚠️ {msg}")
         return {"error": "insufficient_data"}
 
-    # Compute indicators
-    df["donch_high_entry"] = df["high"].rolling(N_ENTRY).max().shift(1)
-    df["donch_low_exit"] = df["low"].rolling(N_EXIT).min().shift(1)
-    df["log_ret"] = ind.log_returns(df["close"])
-    df["sigma_daily"] = df["log_ret"].rolling(VOL_LOOKBACK).std(ddof=1)
-    df["sigma_annual"] = df["sigma_daily"] * (config.ANNUALIZATION_DAYS ** 0.5)
+    # Use last fully-closed daily bar.
+    # If latest bar's date == today UTC, that bar may not be closed yet.
+    today_utc_date = now_utc.date()
+    last_idx = -1
+    if df.index[-1].date() == today_utc_date:
+        last_idx = -2
+        print(f"NOTE: latest bar {df.index[-1].date()} not yet closed; using previous.\n")
 
-    # Latest completed bar (don't trust unconfirmed today bar)
-    # If today's bar exists but hasn't closed (now < bar_close_time), use yesterday
-    last_bar = df.iloc[-1]
-    last_time = df.index[-1]
-    last_bar_close_time = last_time + pd.Timedelta(days=1)
-    if today < last_bar_close_time.to_pydatetime():
-        print(f"NOTE: Latest bar {last_time.date()} not yet closed (closes at {last_bar_close_time}).")
-        print(f"      Using previous confirmed bar instead.\n")
-        last_bar = df.iloc[-2]
-        last_time = df.index[-2]
+    last_bar = df.iloc[last_idx]
+    last_time = df.index[last_idx]
 
     close = float(last_bar["close"])
     donch_high = float(last_bar["donch_high_entry"])
     donch_low = float(last_bar["donch_low_exit"])
     sigma_annual = float(last_bar["sigma_annual"])
 
-    # Vol-target sizing (assume $1000 equity for display — adjust if needed)
     target_fraction = VOL_TARGET / sigma_annual if sigma_annual > 0 else 0
-    capped_fraction = (
-        0 if target_fraction < VOL_MIN
-        else min(target_fraction, VOL_MAX)
-    )
+    capped_fraction = 0 if target_fraction < VOL_MIN else min(target_fraction, VOL_MAX)
 
-    # Signal check
     long_signal = close > donch_high
     exit_signal = close < donch_low
 
-    # Print status
-    print(f"Latest confirmed bar: {last_time.strftime('%Y-%m-%d')} (UTC)")
+    # Console output
+    print(f"Bar:                  {last_time.strftime('%Y-%m-%d')} (UTC)")
     print(f"Close:                ${close:,.2f}")
-    print(f"Donchian-40 High:     ${donch_high:,.2f}  (entry trigger if close > this)")
-    print(f"Donchian-15 Low:      ${donch_low:,.2f}  (exit trigger if close < this)")
+    print(f"Donchian-{N_ENTRY} High:     ${donch_high:,.2f}  (entry trigger)")
+    print(f"Donchian-{N_EXIT} Low:      ${donch_low:,.2f}  (exit trigger)")
     print(f"Realized vol (ann.):  {sigma_annual*100:.1f}%")
     print(f"Vol-target fraction:  {capped_fraction*100:.1f}% of equity")
     print()
 
-    # Distances
+    dist_to_high = (donch_high / close - 1) * 100
+    dist_to_low = (close / donch_low - 1) * 100
+
     if long_signal:
-        print(f">>> LONG ENTRY SIGNAL — Close is +{(close/donch_high-1)*100:.2f}% above 40-day high")
+        status_line = f">>> LONG ENTRY SIGNAL — Close is +{(close/donch_high-1)*100:.2f}% above {N_ENTRY}-day high"
     elif exit_signal:
-        print(f">>> EXIT SIGNAL — Close is {(close/donch_low-1)*100:.2f}% below 15-day low")
+        status_line = f">>> EXIT SIGNAL — Close is {(close/donch_low-1)*100:.2f}% below {N_EXIT}-day low"
     else:
-        dist_to_high = (donch_high / close - 1) * 100
-        dist_to_low = (close / donch_low - 1) * 100
-        print(f"--- NO SIGNAL ---")
-        print(f"   Distance to entry trigger (40d high): +{dist_to_high:.2f}%")
-        print(f"   Distance to exit trigger (15d low):   -{dist_to_low:.2f}%")
+        status_line = (f"--- NO SIGNAL ---\n"
+                       f"   Distance to entry trigger: +{dist_to_high:.2f}%\n"
+                       f"   Distance to exit trigger:  -{dist_to_low:.2f}%")
         if dist_to_high < 2.0:
-            print(f"   [!] CLOSE to entry signal (within 2%)")
+            status_line += "\n   [!] CLOSE to entry signal (within 2%)"
         if dist_to_low < 2.0:
-            print(f"   [!] CLOSE to exit signal (within 2%)")
+            status_line += "\n   [!] CLOSE to exit signal (within 2%)"
+    print(status_line)
     print()
 
-    # Build alert message
+    # Build Telegram message
     msg = None
     if long_signal:
         msg = (
             f"🟢 *D-Alt-Med LONG ENTRY*\n"
-            f"BTC/USDT spot — {last_time.strftime('%Y-%m-%d')}\n\n"
+            f"BTC/USDT — {last_time.strftime('%Y-%m-%d')}\n\n"
             f"Close: ${close:,.2f}\n"
-            f"40d High broken: ${donch_high:,.2f}\n"
+            f"{N_ENTRY}d High broken: ${donch_high:,.2f}\n"
             f"Vol annual: {sigma_annual*100:.1f}%\n"
             f"Target size: {capped_fraction*100:.1f}% of equity\n\n"
             f"Action: BUY at next bar open"
@@ -187,10 +198,30 @@ def check_signal(send_alert: bool = False) -> dict:
     elif exit_signal:
         msg = (
             f"🔴 *D-Alt-Med EXIT*\n"
-            f"BTC/USDT spot — {last_time.strftime('%Y-%m-%d')}\n\n"
+            f"BTC/USDT — {last_time.strftime('%Y-%m-%d')}\n\n"
             f"Close: ${close:,.2f}\n"
-            f"15d Low broken: ${donch_low:,.2f}\n\n"
+            f"{N_EXIT}d Low broken: ${donch_low:,.2f}\n\n"
             f"Action: SELL at next bar open"
+        )
+    elif always_send:
+        # Verification-mode message (no signal but always send)
+        warn_lines = []
+        if dist_to_high < 2.0:
+            warn_lines.append(f"   ⚠️ CLOSE to entry ({dist_to_high:.2f}% away)")
+        if dist_to_low < 2.0:
+            warn_lines.append(f"   ⚠️ CLOSE to exit ({dist_to_low:.2f}% away)")
+        warn = ("\n" + "\n".join(warn_lines)) if warn_lines else ""
+        msg = (
+            f"📊 *D-Alt-Med Daily Check*\n"
+            f"BTC/USDT — {last_time.strftime('%Y-%m-%d')}\n\n"
+            f"Close: ${close:,.2f}\n"
+            f"{N_ENTRY}d High: ${donch_high:,.2f}\n"
+            f"{N_EXIT}d Low: ${donch_low:,.2f}\n"
+            f"Vol annual: {sigma_annual*100:.1f}%\n"
+            f"Target size: {capped_fraction*100:.1f}%\n\n"
+            f"--- NO SIGNAL ---\n"
+            f"Distance to entry: +{dist_to_high:.2f}%\n"
+            f"Distance to exit: -{dist_to_low:.2f}%{warn}"
         )
 
     if msg and send_alert:
@@ -215,15 +246,20 @@ def check_signal(send_alert: bool = False) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="D-Alt-Med daily signal check")
     parser.add_argument("--telegram", action="store_true",
-                        help="Send Telegram alert if signal fires (requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars)")
+                        help="Send Telegram alert (needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars)")
+    parser.add_argument("--always-send", action="store_true",
+                        help="Always send daily Telegram message (verification mode, first week)")
     args = parser.parse_args()
 
     try:
-        check_signal(send_alert=args.telegram)
+        check_signal(send_alert=args.telegram, always_send=args.always_send)
     except Exception as e:
         print(f"ERROR: {e}")
         import traceback
         traceback.print_exc()
+        # Notify on failure too so we know automation broke
+        if args.telegram:
+            send_telegram(f"⚠️ *D-Alt-Med daily check FAILED*\n```\n{e}\n```")
         return 1
 
     return 0
