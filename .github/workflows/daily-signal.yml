@@ -1,11 +1,15 @@
 name: Daily BTC Signal Check (D-Alt-Med)
 
 # Runs every day at 00:30 UTC (30 minutes after daily bar close).
-# Also can be triggered manually from GitHub UI for testing.
+# Also triggerable manually from GitHub UI for testing.
 on:
   schedule:
     - cron: '30 0 * * *'
   workflow_dispatch:
+
+# Allow workflow to commit updated state.json back to repo.
+permissions:
+  contents: write
 
 jobs:
   check-signal:
@@ -29,8 +33,20 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # SIGNAL_EXCHANGE: kraken    # Default. Override to 'coinbase', 'bitstamp', 'okx' if needed.
-          # SIGNAL_SYMBOL: BTC/USDT    # Default.
         # --always-send: send daily status message even if no signal fires.
-        # Remove --always-send after 1 week of verification to get only signal-day alerts.
+        # Remove --always-send after verification week to get only signal-day alerts.
         run: python check_signal.py --telegram --always-send
+
+      - name: Commit state.json changes if any
+        # Auto-commits state.json updates back to repo. Also serves as
+        # "keep-alive": daily commits prevent the 60-day inactivity pause.
+        run: |
+          git config user.name "turtle-bot"
+          git config user.email "bot@noreply.local"
+          git add state.json
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "bot: state update $(date -u +%Y-%m-%d)"
+            git push
+          fi
