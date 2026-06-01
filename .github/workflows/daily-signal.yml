@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write
 
+# Force Node.js 24 for actions (Node 20 deprecation deadline: Sept 16, 2026).
+# Once actions/checkout v5 + setup-python v6 are stable, this can be removed.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   check-signal:
     runs-on: ubuntu-latest
