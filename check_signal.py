@@ -355,7 +355,7 @@ def _build_telegram_message(state, last_time, close, donch_high, donch_low,
                 f"({lt['pnl_pct']:+.2f}%)"
             )
         return (
-            f"📊 *D-Alt-Med Daily Check*\n"
+            f"🟡 *D-Alt-Med Daily Check*\n"
             f"BTC/USDT — {date_str}\n\n"
             f"Status: *FLAT* (watching for entry)\n"
             f"Close: ${close:,.2f}\n"
@@ -373,7 +373,7 @@ def _build_telegram_message(state, last_time, close, donch_high, donch_low,
         if dist_to_low < 2.0:
             warn = f"\n⚠️ CLOSE to exit ({dist_to_low:.2f}% away)"
         return (
-            f"📊 *D-Alt-Med Daily Check*\n"
+            f"🟡 *D-Alt-Med Daily Check*\n"
             f"BTC/USDT — {date_str}\n\n"
             f"Status: *LONG* ({days_held}d held)\n"
             f"Close: ${close:,.2f}\n"
