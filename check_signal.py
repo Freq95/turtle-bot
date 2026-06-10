@@ -1,8 +1,9 @@
 """
 Daily signal checker — D-Alt-Med (40/15) Donchian breakout on BTC/USDT (Binance).
 
-Source of truth: BINANCE BTC/USDT (via CryptoCompare API gateway — works from any IP
-including GitHub Actions US runners that Binance blocks directly).
+Source of truth: global Binance.com BTC/USDT via data-api.binance.vision — Binance's
+public market-data host (no API key). Unlike api.binance.com (HTTP 451 from US IPs),
+this host is reachable from GitHub Actions US runners and serves the same global data.
 
 State-tracked: maintains state.json with current position, last trade, hypothetical P&L.
 After first EXIT, won't fire duplicate exit alerts; only watches for entry. Symmetric.
@@ -40,9 +41,8 @@ VOL_MAX = 1.00
 ANNUALIZATION = 365
 
 STATE_FILE = Path(__file__).parent / "state.json"
-SYMBOL_FSYM = "BTC"
-SYMBOL_TSYM = "USDT"
-SOURCE_EXCHANGE = "Binance"  # CryptoCompare 'e' param — source of truth
+BINANCE_SYMBOL = "BTCUSDT"  # global Binance.com pair — source of truth
+BINANCE_HOST = "https://data-api.binance.vision"  # public market-data host (US-reachable)
 
 
 # ============================================================
@@ -70,49 +70,48 @@ def send_telegram(message: str) -> bool:
 
 
 # ============================================================
-# Data fetch — CryptoCompare gateway with exchange=Binance
+# Data fetch — global Binance via data-api.binance.vision
 # ============================================================
 
 def fetch_binance_daily(days: int = 120) -> pd.DataFrame:
     """
-    Fetch daily OHLCV from BINANCE via CryptoCompare API gateway.
-    CryptoCompare's servers can reach Binance (not US-IP-blocked), so we get
-    Binance's actual prices regardless of where this script runs.
-    Free tier: 100k calls/month. We use ~30/month.
-    """
-    print(f"Source: CryptoCompare gateway / exchange={SOURCE_EXCHANGE} / "
-          f"{SYMBOL_FSYM}/{SYMBOL_TSYM} / last ~{days} days")
+    Fetch daily OHLCV for global Binance.com BTC/USDT via data-api.binance.vision.
 
+    This is Binance's public market-data host (security type NONE — no API key).
+    It serves the same global data as api.binance.com but, unlike that host, is
+    reachable from GitHub Actions US runners (api.binance.com returns HTTP 451).
+
+    The candle index is each bar's OPEN time (UTC). The most recent bar is the
+    still-forming current day; the caller drops it and signals off closed bars.
+    """
+    print(f"Source: Binance global / {BINANCE_HOST} / {BINANCE_SYMBOL} / last ~{days} days")
+
+    # Ask for one extra bar so a full `days` of closed candles remains after the
+    # in-progress current-day bar is dropped downstream. Binance caps at 1000.
     url = (
-        f"https://min-api.cryptocompare.com/data/v2/histoday"
-        f"?fsym={SYMBOL_FSYM}&tsym={SYMBOL_TSYM}"
-        f"&limit={days}&e={SOURCE_EXCHANGE}"
+        f"{BINANCE_HOST}/api/v3/klines"
+        f"?symbol={BINANCE_SYMBOL}&interval=1d&limit={min(days + 1, 1000)}"
     )
 
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "turtle-bot/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+            bars = json.loads(resp.read())
     except Exception as e:
-        raise RuntimeError(f"CryptoCompare fetch failed: {e}")
+        raise RuntimeError(f"Binance fetch failed: {e}")
 
-    if data.get("Response") != "Success":
-        raise RuntimeError(f"CryptoCompare error: {data.get('Message', 'unknown')}")
-
-    bars = data["Data"]["Data"]
     if not bars:
-        raise RuntimeError("CryptoCompare returned empty data")
+        raise RuntimeError("Binance returned empty data")
 
-    df = pd.DataFrame(bars)
-    df = df.rename(columns={"time": "timestamp", "volumefrom": "volume"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    # Kline row schema: [openTime, open, high, low, close, volume, closeTime, ...].
+    cols = ["open_time", "open", "high", "low", "close", "volume",
+            "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"]
+    df = pd.DataFrame(bars, columns=cols)
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df = df.set_index("timestamp")
     df = df[["open", "high", "low", "close", "volume"]].astype(float)
 
-    # Sort ascending by time (CryptoCompare returns ascending but guarantee)
     df = df.sort_index()
-
-    # Filter out zero/empty bars (CryptoCompare sometimes returns leading zeros)
     df = df[df["close"] > 0]
     return df
 
@@ -206,6 +205,15 @@ def check_signal(send_alert: bool = False, always_send: bool = False) -> dict:
     donch_low = float(last_bar["donch_low_exit"])
     sigma_annual = float(last_bar["sigma_annual"])
 
+    # Date the active 40-day entry high was set. Use the exact same window the
+    # trigger uses — the N_ENTRY bars *before* the reference bar (rolling+shift(1)) —
+    # so the reported high always matches donch_high.
+    ref_pos = len(df) + last_idx  # absolute index of the last closed bar
+    hi_window = df.iloc[ref_pos - N_ENTRY:ref_pos]
+    high_date = hi_window["high"].idxmax()
+    high_date_str = high_date.strftime("%Y-%m-%d")
+    days_since_high = (last_time.date() - high_date.date()).days
+
     target_fraction = VOL_TARGET / sigma_annual if sigma_annual > 0 else 0
     capped_fraction = 0 if target_fraction < VOL_MIN else min(target_fraction, VOL_MAX)
 
@@ -224,6 +232,7 @@ def check_signal(send_alert: bool = False, always_send: bool = False) -> dict:
     print(f"Bar:                  {last_time.strftime('%Y-%m-%d')} (UTC)")
     print(f"Close:                ${close:,.2f}")
     print(f"Donchian-{N_ENTRY} High:     ${donch_high:,.2f}")
+    print(f"  └ high set on:       {high_date_str} ({days_since_high}d ago)")
     print(f"Donchian-{N_EXIT} Low:      ${donch_low:,.2f}")
     print(f"Realized vol (ann.):  {sigma_annual*100:.1f}%")
     print(f"Vol-target fraction:  {capped_fraction*100:.1f}% of equity")
@@ -289,6 +298,7 @@ def check_signal(send_alert: bool = False, always_send: bool = False) -> dict:
     msg = _build_telegram_message(
         state, last_time, close, donch_high, donch_low, sigma_annual, capped_fraction,
         dist_to_high, dist_to_low, actionable_entry, actionable_exit, always_send,
+        high_date_str, days_since_high,
     )
 
     if msg and send_alert:
@@ -308,7 +318,8 @@ def check_signal(send_alert: bool = False, always_send: bool = False) -> dict:
 
 def _build_telegram_message(state, last_time, close, donch_high, donch_low,
                             sigma_annual, capped_fraction, dist_to_high, dist_to_low,
-                            actionable_entry, actionable_exit, always_send) -> str | None:
+                            actionable_entry, actionable_exit, always_send,
+                            high_date_str, days_since_high) -> str | None:
     """Build the Telegram message. Returns None if nothing to send."""
     date_str = last_time.strftime("%Y-%m-%d")
 
@@ -318,6 +329,7 @@ def _build_telegram_message(state, last_time, close, donch_high, donch_low,
             f"BTC/USDT — {date_str}\n\n"
             f"Close: ${close:,.2f}\n"
             f"{N_ENTRY}d High broken: ${donch_high:,.2f}\n"
+            f"(high set {high_date_str}, {days_since_high}d ago)\n"
             f"Vol annual: {sigma_annual*100:.1f}%\n"
             f"*Target size: {capped_fraction*100:.1f}% of equity*\n\n"
             f"Action: BUY at next bar open"
@@ -360,6 +372,7 @@ def _build_telegram_message(state, last_time, close, donch_high, donch_low,
             f"Status: *FLAT* (watching for entry)\n"
             f"Close: ${close:,.2f}\n"
             f"{N_ENTRY}d High (entry trigger): ${donch_high:,.2f}\n"
+            f"High set: {high_date_str} ({days_since_high}d ago)\n"
             f"Distance to entry: +{dist_to_high:.2f}%{warn}\n\n"
             f"Vol annual: {sigma_annual*100:.1f}%\n"
             f"Target size if signal: {capped_fraction*100:.1f}%{last_trade_line}"
