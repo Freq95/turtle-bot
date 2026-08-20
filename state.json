@@ -1,7 +1,11 @@
 {
-  "entry": null,
+  "entry": {
+    "date": "2026-08-19",
+    "price": 69334.79,
+    "size_fraction": 0.8993610034844737
+  },
   "last_trade": null,
-  "position": "FLAT",
-  "updated_at": "2026-08-19T01:58:43Z",
+  "position": "LONG",
+  "updated_at": "2026-08-20T01:57:32Z",
   "version": 1
 }
