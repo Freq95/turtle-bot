@@ -1,11 +1,13 @@
 {
-  "entry": {
-    "date": "2026-08-19",
-    "price": 69334.79,
-    "size_fraction": 0.8993610034844737
+  "entry": null,
+  "last_trade": {
+    "entry_date": "2026-08-19",
+    "entry_price": 69334.79,
+    "exit_date": "2026-09-15",
+    "exit_price": 75644.48,
+    "pnl_pct": 9.1003
   },
-  "last_trade": null,
-  "position": "LONG",
-  "updated_at": "2026-09-15T05:07:19Z",
+  "position": "FLAT",
+  "updated_at": "2026-09-16T05:02:20Z",
   "version": 1
 }
